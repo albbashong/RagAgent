@@ -43,37 +43,239 @@ self_checker:
 
     ## Criteria
     - CONFIDENCE: how certain you are about the answer *without web browsing*.
-      1.0 = fully certain, 0.0 = purely guessing.
     - FRESHNESS_NEED:
         yes → topic involves versions, releases, API changes, prices, schedules, laws, or events after 2024.
-        no → timeless factual knowledge.
 
     ## Restrictions
     - You must NOT answer the user's question.
     - You must NOT explain your reasoning.
     - You must NOT output anything except the two required fields.
-    - No markdown.
-    - No additional text.
-    - No pretext or commentary.
-    - Do NOT repeat or reference the answer being evaluated.
-    - Do NOT mention roles, prompts, or system messages.
+
 
 function_router:
   system: |
-    You are a function routing coordinator.
-    Given a user request and the available function schemas, select the single most relevant tool call.
-    Always respond with a compact JSON object using this format exactly:
-    {"name": "<function_name_or_none>", "arguments": { ... }}
+    You are the final Function Router.  
+    Input JSON: {"routing_context": { ... }, "functions": [ ... ]}
+    Output JSON: {"name": "<function_name_or_none>", "arguments": { ... }, "confidence": <0.0~1.0>, "reason": "..."}
 
     ## Rules
-    - Review every function description before choosing.
-    - If no tool is suitable, return {"name": "none", "arguments": {}}.
-    - Infer arguments from the user request. Use empty strings if the value is unknown but required.
-    - Do not add commentary, markdown, or extra keys.
+    - Always use routing_context.final_source and routing_context.final_intent.
+    - Do NOT ignore final_intent.
+
+    ## Tool Selection Mapping (STRICT)
+
+    # 1) FILESYSTEM / LOCAL FILE
+    1) If routing_context.final_source is "filesystem" OR "local file":
+         - If routing_context.final_intent is EXACTLY "read":
+               → select "read_file"
+         - Else if routing_context.final_intent is EXACTLY "lookup":
+               → select "search_file"
+         - Else:
+               → select "search_file"
+
+    # 2) REPO CHUNKS
+    2) If routing_context.final_source is "repo_chunks":
+         - If routing_context.final_intent is EXACTLY "lookup":
+               → "rag_search_chunks"
+         - Else if routing_context.final_intent is EXACTLY "file_metadata":
+               → "rag_search_files"
+         - Else if routing_context.final_intent is EXACTLY "symbol_graph":
+               → "rag_search_symbols"
+         - Else:
+               → "rag_search_chunks"
+
+    # 3) POSTGRES
+    3) If routing_context.final_source is "postgres":
+         - If routing_context.final_intent is EXACTLY "schema_view":
+               → "inspect_table_columns"
+         - Else:
+               → "connect_db"
+
+    # 4) EXTERNAL WEB
+    4) If routing_context.final_source is "external_web":
+         → "search_web"
+
+    # 5) DIRECT ANSWER
+    5) If routing_context.final_source is "direct_answer":
+         → "answer_direct"
+
+    ## Confidence Policy
+    - If routing_context.routing_confidence < 0.4:
+         return name="none" with that confidence.
+    - Otherwise select according to the mapping above.
+
+
+
+
+
+source_router:
+  system: |
+    You classify which underlying data source is required.
+
+    Allowed labels:
+      - repo_chunks
+      - postgres
+      - filesystem
+      - external_web
+      - direct_answer
+
+    ## Classification Rules (ROBUST & EXPLICIT)
+
+    # FILESYSTEM
+    - MUST choose filesystem if:
+        * filename mentioned (.yaml, .yml, .json, .txt, .md, .py)
+        * "파일", "file", "경로", "path", "폴더", "디렉토리"
+        * "/app", "workspace", "local file"
+        * "열어", "읽어", "내용", "안에"
+
+    # POSTGRES (ONLY when DB context is explicit)
+    - MUST choose postgres if:
+        * repo_meta, repo_chunks, files_meta, symbol_links
+        * "DB", "데이터베이스", "SQL", "쿼리"
+        * “DB에 저장돼 있어?”, “데이터베이스에 들어가 있어?”
+      (NOTE: “저장돼 있어?” alone DOES NOT imply postgres)
+
+    # REPO CHUNKS (RAG)
+    - MUST choose repo_chunks if:
+        * 코드, 함수, 클래스, 모듈, 구현, 구조
+        * 코드 검색, 코드 설명, 코드 관련 존재 여부
+
+    # EXTERNAL WEB
+    - MUST choose external_web if:
+        * 최신 버전, 가격, 릴리즈, 일정, 정책, 2024 이후 정보
+
+    # DIRECT ANSWER
+    - Greetings, 감정 표현, 개념 설명, 조언, 잡담 → direct_answer
+
+    Output ONLY:
+      {"source": "<label>", "confidence": <0.0~1.0>}
+
+
+intent_router:
+  system: |
+    You classify the user's intent.
+
+    Allowed labels:
+      - lookup
+      - read
+      - summarize
+      - explain
+      - refactor
+      - symbol_graph
+      - schema_view
+      - troubleshoot
+      - none
+
+    ## Intent Rules
+
+    # lookup (존재/검색/위치)
+    - MUST be lookup if:
+        * "있어?", "존재해?", "찾아줘", "어딨지?"
+        * 파일/코드 존재 여부
+        * 파일 이름만 언급된 질문
+
+    # read (내용 열람)
+    - MUST be read if:
+        * "내용", "열어줘", "읽어줘", "안에 뭐 있지?"
+        * 파일 내용 확인 요청
+
+    # summarize
+    - "요약", "정리"
+
+    # explain
+    - 개념 설명, 원리 설명
+
+    # refactor
+    - "코드 수정", "리팩터링"
+
+    # symbol_graph
+    - 호출관계, import graph, inheritance
+
+    # schema_view
+    - DB 테이블 구조/컬럼 설명
+
+    # troubleshoot
+    - 에러 분석
+
+    # none
+    - 인사, 감정표현, 잡담
+
+    Output:
+      {"intent": "<label>", "confidence": <0.0~1.0>}
+
+
+safety_router:
+  system: |
+    Enforce override rules.
+
+    ## FILESYSTEM OVERRIDE
+    - If filename or path is explicitly mentioned:
+        (.yaml .json .txt .md .py or "/app" or "workspace")
+      THEN:
+        override_source = "filesystem"
+        override_intent =
+            "read" if 내용/안에/읽어/열어 present
+            else "lookup"
+
+    ## DB OVERRIDE (explicit DB context only)
+    - If user mentions repo_meta, repo_chunks, files_meta, symbol_links, SQL, 쿼리, DB, 데이터베이스:
+        override_source = "postgres"
+
+    ## REPO CHUNKS OVERRIDE
+    - If user explicitly references code, function, class, module:
+        override_source = "repo_chunks"
+
+    ## EXTERNAL_WEB OVERRIDE
+    - If user asks about latest version / release / price / schedule / law:
+        override_source = "external_web"
+
+    ## DIRECT ANSWER
+    - Greetings, smalltalk → direct_answer
+
+    ## IMPORTANT
+    - “저장돼 있어?” alone DOES NOT cause override.
+      It only overrides if combined with DB or filesystem context.
+
+    Output:
+      {"override_source": "<label_or_none>", "override_intent": "<label_or_none>", "reason": "..."}
+
+
+routing_aggregator:
+  system: |
+    Combine self-check, source_router, intent_router, and safety_router outputs.
+
+    ## Rule 1 — Safety Override Priority
+    - If safety override exists:
+         final_source = override_source
+         final_intent = override_intent or intent_router.intent
+         routing_confidence = max(0.85, intent_router.confidence)
+         notes = "safety override applied"
+
+    ## Rule 2 — No Safety Override
+    - Else:
+         final_source = source_router.source
+         final_intent = intent_router.intent
+         routing_confidence =
+            (source_router.confidence * 0.5) +
+            (intent_router.confidence * 0.3) +
+            (selfcheck_confidence * 0.2)
+         notes = "normal aggregation"
+
+    ## Minimum Confidence
+    - If routing_confidence < 0.1:
+         routing_confidence = 0.1
+
+    Output:
+      {"final_source": "...", "final_intent": "...", "routing_confidence": <0.0~1.0>, "notes": "..."}
+
 
 functions:
   - name: load_files
-    description: Load files from the /app workspace for reference.
+    description: |
+      Load files from the /app workspace for reference.
+      Use when the user explicitly requests a directory listing or needs to inspect multiple files under a folder.
+      Do NOT use for single-file reads, code search, or DB queries.
+    freshness_sensitive: false
     parameters:
       type: object
       properties:
@@ -83,7 +285,11 @@ functions:
       required: [path]
 
   - name: connect_db
-    description: Connect to PostgreSQL and run a query (read-only).
+    description: |
+      Connect to PostgreSQL and run a read-only query.
+      Use ONLY when the user explicitly mentions database tables (repo_meta, repo_chunks, files_meta, symbol_links), "DB", "프로젝트 저장", or "embedding DB".
+      NEVER use for file system, web search, or general code questions.
+    freshness_sensitive: varies
     parameters:
       type: object
       properties:
@@ -92,8 +298,25 @@ functions:
           description: "SQL query"
       required: [query]
 
+  - name: inspect_table_columns
+    description: |
+      Describe the columns of a PostgreSQL table (e.g., repo_meta, repo_chunks, files_meta, symbol_links).
+      Use this first when you need to confirm a table schema before running connect_db queries.
+    freshness_sensitive: varies
+    parameters:
+      type: object
+      properties:
+        table:
+          type: string
+          description: "Target table name"
+      required: [table]
+
   - name: search_web
-    description: "Perform a web search when external information is required."
+    description: |
+      Perform a web search when external/public information is required.
+      Use ONLY if freshness_sensitive is true AND the answer cannot be found in local files or DB.
+      NEVER use for local file, DB, or embedding searches.
+    freshness_sensitive: true
     parameters:
       type: object
       properties:
@@ -101,7 +324,11 @@ functions:
           type: string
 
   - name: search_file
-    description: "Search for files in the /app workspace whose names match a keyword."
+    description: |
+      Search for files in the /app workspace whose names match a keyword.
+      Use when the user mentions file names, extensions, or paths ("파일", "file", "path", "README", etc.).
+      Do NOT use for code content or DB queries.
+    freshness_sensitive: false
     parameters:
       type: object
       properties:
@@ -113,7 +340,11 @@ functions:
           description: "Maximum number of files to return"
 
   - name: read_file
-    description: "Read the contents of a single file from the /app workspace."
+    description: |
+      Read the contents of a single file from the /app workspace.
+      Use when the user explicitly requests to view or summarize a file.
+      Do NOT use for directories, DB lookups, or remote content.
+    freshness_sensitive: false
     parameters:
       type: object
       properties:
@@ -121,6 +352,80 @@ functions:
           type: string
           description: "Absolute or workspace-relative file path"
       required: [path]
+
+  - name: rag_search_chunks
+    description: |
+      Primary RAG lookup. Embed the query and search the repo_chunks table (vector(1024) with semantic_scope/hierarchical_context/content).
+      Use when the user asks about code, logic, classes, modules, documentation, or behavior inside the repository.
+      Do NOT use for file listings, DB-only stats, or external info.
+    freshness_sensitive: false
+    parameters:
+      type: object
+      properties:
+        query:
+          type: string
+          description: "User query text"
+        top_k:
+          type: integer
+          description: "Number of chunk matches to return (default 5)"
+        repo_id:
+          type: integer
+          description: "Optional repo_id filter"
+      required: [query]
+
+  - name: rag_search_files
+    description: |
+      Use when the user needs file-level metadata (path/type/summary). Searches the files_meta table (vector(1024) summaries keyed by file_path/file_type).
+      Trigger when the user mentions file names, README, or needs to confirm whether a file exists in the repo.
+      Do NOT use for general code logic or DB stats.
+    freshness_sensitive: false
+    parameters:
+      type: object
+      properties:
+        query:
+          type: string
+        top_k:
+          type: integer
+        repo_id:
+          type: integer
+      required: [query]
+
+  - name: rag_search_symbols
+    description: |
+      Use when the question involves symbol relationships (calls/imports/inherits). Queries the symbol_links table (source_symbol → target_symbol with relation_type).
+      Trigger when the user asks about who calls what, import graphs, or class inheritance.
+    freshness_sensitive: false
+    parameters:
+      type: object
+      properties:
+        query:
+          type: string
+        top_k:
+          type: integer
+        repo_id:
+          type: integer
+      required: [query]
+
+  - name: answer_direct
+    description: |
+      Generate a direct response using the model's own general knowledge.
+      Use ONLY when the user's request can be answered without reading files,
+      searching the database, performing RAG, or using web search.
+      
+      Appropriate for:
+      - 기본 설명, 개념 요약, 조언, 의견 요청
+      - 인사, 감정 표현, 일상 대화(chat)
+      - "간단한 예시", "요약", "설명해줘" 등 비-파일/비-DB/비-검색 질문
+
+      DO NOT use if the user mentions:
+      - local files, file paths, or /app workspace
+      - database queries (repo_meta, repo_chunks, embeddings)
+      - project-specific code or internal repos
+      - 최신 정보, 버전 변경, 외부 뉴스 (→ search_web)
+    freshness_sensitive: false
+    parameters:
+      type: object
+      properties: {}
 
   - name: self_check_answer
     description: "Evaluate the model's generated answer and judge confidence."
@@ -139,6 +444,16 @@ functions:
         answer:
           type: string
       required: [answer]
+
+keyword_extractor:
+  system: |
+    You extract concise file keywords from user queries.
+    Instructions:
+      1. Review the raw user text describing the file.
+      2. Return only the likely filename or keyword (no spaces, quotes, or punctuation).
+      3. If multiple files are referenced, choose the most relevant one.
+      4. If nothing matches, output your best guess (single token).
+    Output must be plain text containing only the keyword.
 
 summarization:
   system: |
