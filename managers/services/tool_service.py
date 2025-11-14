@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -30,6 +31,10 @@ class ToolService:
         self.function_definitions: List[Dict[str, Any]] = llm_manager.prompts.get("functions", []) or []
         self.has_function_router = "function_router" in llm_manager.prompts
         self.rag_manager = rag_manager or RAGQueryManager()
+        self.last_user_query: str = ""
+
+    def set_last_user_query(self, text: str):
+        self.last_user_query = text or ""
 
     async def plan_tool(self, user_text: str) -> Dict[str, Any] | None:
         if not self.function_definitions or not self.has_function_router:
@@ -172,10 +177,18 @@ class ToolService:
             columns = [desc[0] for desc in cur.description] if cur.description else []
             limited = rows[:50]
             result_rows = [
-                {columns[idx]: value for idx, value in enumerate(row)}
+                {
+                    columns[idx]: self._serialize_db_value(value)
+                    for idx, value in enumerate(row)
+                }
                 for row in limited
             ]
-            return json.dumps({"rows": result_rows, "rowCount": len(rows)}, ensure_ascii=False, indent=2)
+            cur.close()
+            extra_section = self._build_postgres_followup(query, result_rows, conn)
+            payload = json.dumps({"rows": result_rows, "rowCount": len(rows)}, ensure_ascii=False, indent=2)
+            if extra_section:
+                return f"{payload}\n\n{extra_section}"
+            return payload
         finally:
             conn.close()
 
@@ -351,6 +364,114 @@ class ToolService:
             return json.loads(text[start:end])
         except (ValueError, json.JSONDecodeError):
             return None
+
+    @staticmethod
+    def _serialize_db_value(value: Any) -> Any:
+        if isinstance(value, (datetime, date, time)):
+            return value.isoformat()
+        return value
+
+    def _build_postgres_followup(self, query: str, result_rows: List[Dict[str, Any]], conn) -> str:
+        query_lower = (query or "").lower()
+        if "repo_meta" not in query_lower:
+            return ""
+        if not self._needs_file_listing():
+            return ""
+        repo_ids: List[int] = []
+        for row in result_rows:
+            candidate = row.get("id") or row.get("repo_id")
+            if isinstance(candidate, int) and candidate not in repo_ids:
+                repo_ids.append(candidate)
+        if not repo_ids:
+            return ""
+        files_map = self._fetch_file_paths(conn, repo_ids)
+        if not files_map:
+            return ""
+        file_tokens = self._extract_file_tokens(self.last_user_query)
+        lines: List[str] = ["[Related Files]"]
+        for repo_id in repo_ids:
+            paths = files_map.get(repo_id)
+            if not paths:
+                continue
+            lines.append(f"repo_id={repo_id}")
+            for path in paths[:15]:
+                lines.append(f"  - {path}")
+            if len(paths) > 15:
+                lines.append("  - ...")
+        lines.append("")
+        lines.append("[Suggested Follow-ups]")
+        lines.append("- rag_search_files → 파일 존재 여부와 위치를 더 정확히 확인")
+        lines.append("- rag_search_chunks → 구현/모델 구조를 살펴보기")
+        auto_section = self._auto_fetch_file_context(repo_ids, file_tokens)
+        if auto_section:
+            lines.append("")
+            lines.append(auto_section)
+        return "\n".join(lines)
+
+    def _fetch_file_paths(self, conn, repo_ids: List[int]) -> Dict[int, List[str]]:
+        if not repo_ids:
+            return {}
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT repo_id, file_path FROM files_meta WHERE repo_id = ANY(%s) ORDER BY repo_id, file_path LIMIT 300",
+                (repo_ids,),
+            )
+            files_map: Dict[int, List[str]] = {}
+            for repo_id, file_path in cur.fetchall():
+                files_map.setdefault(int(repo_id), []).append(file_path)
+            return files_map
+        finally:
+            cur.close()
+
+    def _needs_file_listing(self) -> bool:
+        text = (self.last_user_query or "").lower()
+        if not text:
+            return False
+        keywords = ["구조", "모델", "정의", "파일", "structure", "model", "definition", "file"]
+        return any(keyword in text for keyword in keywords)
+
+    def _extract_file_tokens(self, text: str) -> List[str]:
+        if not text:
+            return []
+        pattern = re.compile(r"[\w./\\-]+\.[A-Za-z0-9]+")
+        tokens: List[str] = []
+        for match in pattern.findall(text):
+            token = match.strip().strip("'\"` “”。")
+            if token and token not in tokens:
+                tokens.append(token)
+        return tokens
+
+    def _auto_fetch_file_context(self, repo_ids: List[int], file_tokens: List[str]) -> str:
+        if not repo_ids or not file_tokens:
+            return ""
+        repo_id = repo_ids[0]
+        token = file_tokens[0]
+        lines: List[str] = []
+        try:
+            files_results = self.rag_manager.search_files(token, top_k=3, repo_id=repo_id)
+        except Exception as exc:
+            files_results = []
+            lines.append(f"[Auto rag_search_files 실패: {exc}]")
+        if files_results:
+            lines.append(f"[Auto rag_search_files: '{token}']")
+            for res in files_results:
+                lines.append(f"- {res.file_path} (score={res.score:.3f})")
+        try:
+            chunks_results = self.rag_manager.search_chunks(token, top_k=2, repo_id=repo_id)
+        except Exception as exc:
+            chunks_results = []
+            lines.append(f"[Auto rag_search_chunks 실패: {exc}]")
+        if chunks_results:
+            lines.append("")
+            lines.append(f"[Auto rag_search_chunks: '{token}']")
+            for idx, res in enumerate(chunks_results, start=1):
+                snippet = (res.content or "").strip()
+                if len(snippet) > 400:
+                    snippet = snippet[:400] + "..."
+                lines.append(f"({idx}) file_path={res.file_path} score={res.score:.3f}")
+                lines.append(snippet)
+        return "\n".join(lines).strip()
 
 
 __all__ = ["ToolService"]

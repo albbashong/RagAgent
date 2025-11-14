@@ -21,6 +21,9 @@ from managers.context_manager import ContextManager
 from managers.services.tool_service import ToolService
 from managers.services.self_check_service import SelfCheckService
 from managers.services.routing_manager import MultiSignalRouter
+from managers.embedding import EmbeddingManager
+from managers.rag_query import RAGQueryManager
+from managers.topic_manager import TopicManager
 from utils.torch_version_loader import TorchVersionLoader
 
 
@@ -50,9 +53,13 @@ llm_lock = asyncio.Lock()
 llm_manager = LLMManager()
 agent = LLMAgent(llm_manager)
 torch_loader = TorchVersionLoader(base_dir="/app/pytorch_versions")
-context_manager = ContextManager()
+shared_embedder = EmbeddingManager()
+context_manager = ContextManager(embedder=shared_embedder)
+TOPIC_SIMILARITY_THRESHOLD = 0.6
+topic_manager = TopicManager(embedder=shared_embedder, similarity_threshold=TOPIC_SIMILARITY_THRESHOLD)
 RG_BINARY = shutil.which("rg")
 PRIMARY_TASK = "assistant"
+CONTEXT_SIMILARITY_THRESHOLD = 0.55
 
 
 # ============================
@@ -255,10 +262,15 @@ async def handle_closing_behavior_request(tab_id: int | None):
         )
         return
 
+    conversation_id = topic_manager.active_conversation_id(tab_id) or tab_id
     combined_prompt = f"{torch_prompt}\n\n[User Request]\n{last_request['user_text']}"
     response_text = await run_llm_call(combined_prompt, task=PRIMARY_TASK)
     clean_response = _strip_reasoning_output(response_text)
-    context_manager.add_message(tab_id, "assistant", clean_response)
+    context_manager.add_message(conversation_id, "assistant", clean_response)
+    active_topic = topic_manager.active_topic_id(tab_id)
+    if active_topic:
+        topic_embedding = context_manager.get_context_embedding(conversation_id)
+        topic_manager.update_topic_embedding(tab_id, active_topic, topic_embedding)
     await broadcast(
         {
             "type": "llm_response",
@@ -276,27 +288,35 @@ async def handle_closing_behavior_request(tab_id: int | None):
 # ============================
 async def handle_user_message(user_text: str, tab_id: int | None):
     try:
-        context_manager.add_message(tab_id, "user", user_text)
+        topic_assignment = topic_manager.assign_topic(tab_id, user_text)
+        topic_id = topic_assignment["topic_id"]
+        topic_similarity = topic_assignment.get("similarity")
+        topic_is_new = topic_assignment.get("is_new")
+        conversation_id = topic_manager.topic_conversation_id(tab_id, topic_id)
+
+        include_history = not topic_is_new
+        if topic_similarity is not None:
+            include_history = topic_similarity >= CONTEXT_SIMILARITY_THRESHOLD
+        print(
+            f"[Topic] tab={tab_id} topic={topic_id} "
+            f"is_new={topic_is_new} similarity={topic_similarity} "
+            f"include_history={include_history}"
+        )
+
+        context_manager.add_message(conversation_id, "user", user_text)
+        tool_service.set_last_user_query(user_text)
 
         if _closing_trigger_matches(user_text):
             await handle_closing_behavior_request(tab_id)
             return
         self_check = await self_check_service.run(user_text)
         if self_check:
-            await broadcast(
-                {
-                    "type": "self_check",
-                    "text": (
-                        f"Self-check → confidence={self_check.get('confidence')} "
-                        f"freshness={self_check.get('freshness_need')}"
-                    ),
-                    "data": self_check,
-                    "tabId": tab_id,
-                    "timestamp": current_timestamp(),
-                }
+            print(
+                f"[SelfCheck] confidence={self_check.get('confidence')} "
+                f"freshness={self_check.get('freshness_need')}"
             )
 
-        routing_result = await routing_manager.route(user_text, self_check)
+        routing_result = await routing_manager.route(user_text, self_check, state_key=conversation_id)
         function_call = routing_result.get("function_call") or {}
         plan_meta = {
             "name": function_call.get("name"),
@@ -307,6 +327,7 @@ async def handle_user_message(user_text: str, tab_id: int | None):
         tool_block = ""
         executed_function = None
         tool_meta = None
+        tool_payload = None
         if function_call.get("name") and function_call.get("name") != "none":
             if tool_service.is_answer_direct(function_call):
                 executed_function = {"name": "answer_direct", "arguments": {}}
@@ -314,7 +335,25 @@ async def handle_user_message(user_text: str, tab_id: int | None):
                 try:
                     func_output, executed_function, tool_meta = await tool_service.execute_tool(function_call)
                     tool_block = f"[Tool Result: {executed_function['name']}]\n{func_output}"
-                    context_manager.add_message(tab_id, "tool", tool_block)
+                    context_manager.add_message(conversation_id, "tool", tool_block)
+                    tool_payload = {
+                        "name": executed_function["name"],
+                        "arguments": executed_function.get("arguments"),
+                        "text": func_output,
+                        "meta": tool_meta,
+                    }
+                    await broadcast(
+                        {
+                            "type": "tool_result",
+                            "text": func_output,
+                            "data": {
+                                "function": executed_function,
+                                "meta": tool_meta,
+                            },
+                            "tabId": tab_id,
+                            "timestamp": current_timestamp(),
+                        }
+                    )
                 except Exception as exc:
                     await broadcast(
                         {
@@ -330,14 +369,23 @@ async def handle_user_message(user_text: str, tab_id: int | None):
                     executed_function = None
                     tool_meta = None
 
-        full_prompt = context_manager.build_prompt(tab_id, user_text)
+        full_prompt = context_manager.build_prompt(conversation_id, user_text, include_history=include_history)
         if tool_block:
             full_prompt = f"{full_prompt}\n\n{tool_block}"
 
         response_text = await run_llm_call(full_prompt, task=PRIMARY_TASK)
         clean_response = _strip_reasoning_output(response_text)
-        context_manager.add_message(tab_id, "assistant", clean_response)
+        context_manager.add_message(conversation_id, "assistant", clean_response)
+        topic_embedding = context_manager.get_context_embedding(conversation_id)
+        topic_manager.update_topic_embedding(tab_id, topic_id, topic_embedding)
 
+        context_gate_meta = {
+            "includeHistory": include_history,
+            "threshold": CONTEXT_SIMILARITY_THRESHOLD,
+            "topicSimilarity": topic_similarity,
+            "topicId": topic_id,
+            "topicIsNew": topic_is_new,
+        }
         await broadcast(
             {
                 "type": "llm_response",
@@ -345,9 +393,21 @@ async def handle_user_message(user_text: str, tab_id: int | None):
                 "data": {
                     "task": PRIMARY_TASK,
                     "function": executed_function,
-                    "selfCheck": self_check,
+                    "toolResult": tool_payload,
+                    "routingDebug": {
+                        "functionRouter": routing_result.get("function_router"),
+                        "fallback": routing_result.get("fallback_function"),
+                        "final": routing_result.get("final_function"),
+                    },
                     "planMeta": plan_meta,
                     "routingContext": routing_result.get("routing_context"),
+                    "topic": {
+                        "id": topic_id,
+                        "similarity": topic_similarity,
+                        "isNew": topic_is_new,
+                        "threshold": TOPIC_SIMILARITY_THRESHOLD,
+                    },
+                    "contextSimilarity": context_gate_meta,
                     "sourceRouter": routing_result.get("source"),
                     "intentRouter": routing_result.get("intent"),
                     "safetyRouter": routing_result.get("safety"),
@@ -419,10 +479,12 @@ async def run_llm_call(
 # ============================
 # Services
 # ============================
+rag_manager = RAGQueryManager(embedder=shared_embedder)
 tool_service = ToolService(
     llm_manager=llm_manager,
     run_llm_call=run_llm_call,
     workspace_root=WORKSPACE_ROOT,
+    rag_manager=rag_manager,
 )
 self_check_service = SelfCheckService(
     llm_manager=llm_manager,
@@ -431,6 +493,7 @@ self_check_service = SelfCheckService(
 routing_manager = MultiSignalRouter(
     run_llm_call=run_llm_call,
     tool_definitions=tool_service.function_definitions,
+    embedder=shared_embedder,
 )
 
 
